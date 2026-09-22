@@ -4,6 +4,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from safetensors.torch import load_file
+from transformers import AutoTokenizer
 
 from .utils import (
     QTYPES,
@@ -69,9 +71,6 @@ def resolve_device(device):
 
 class Agent:
     def __init__(self, model_directory=None, device=None):
-        from safetensors.torch import load_file
-        from transformers import AutoTokenizer
-
         self.model_directory = resolve_model_directory(model_directory)
         with (self.model_directory / "rl_agent_config.json").open(
             encoding="utf-8"
