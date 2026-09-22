@@ -1,5 +1,6 @@
 import json
 import math
+from bisect import bisect_left
 
 import numpy as np
 import torch
@@ -9,6 +10,10 @@ from transformers import AutoConfig, AutoModel
 QTYPES = {"choice": 0, "score": 1, "noul": 2}
 QTYPE_NAMES = {value: key for key, value in QTYPES.items()}
 TEMP_MIN, TEMP_MAX = 0.5, 5.0
+NOUL_DEFAULTS = {
+    "false": "no, the statement does not hold",
+    "true": "yes, the statement holds",
+}
 
 
 def render(value):
@@ -23,7 +28,7 @@ def render_options(question):
     question_type, criteria = question["t"], question.get("crit")
     if question_type == "choice":
         return [
-            key if value is None or value == "" else f"{key}: {render(value)}"
+            key if value in (None, "") else f"{key}: {render(value)}"
             for key, value in criteria.items()
         ]
     if question_type == "score":
@@ -32,28 +37,24 @@ def render_options(question):
         ]
     criteria = criteria or {}
     return [
-        f"false: {render(criteria['false'])}"
-        if criteria.get("false") not in (None, "")
-        else "false: no, the statement does not hold",
-        f"true: {render(criteria['true'])}"
-        if criteria.get("true") not in (None, "")
-        else "true: yes, the statement holds",
+        f"{key}: {render(criteria[key]) if criteria.get(key) not in (None, '') else default}"
+        for key, default in NOUL_DEFAULTS.items()
     ]
 
 
 def build_sequence(tokenizer, state, question, max_length, head_max_length):
-    mask_token = tokenizer.mask_token
+    mask = tokenizer.mask_token
+
+    def encode(text, limit=None):
+        ids = tokenizer(
+            str(text).replace(mask, " "), add_special_tokens=False
+        ).input_ids
+        return ids if limit is None else ids[:limit]
+
     options = render_options(question)
-    instructions = str(question["ins"]).replace(mask_token, " ")
-    head = tokenizer(
-        f"{question['t']} question: {instructions}", add_special_tokens=False
-    )["input_ids"]
+    head = encode(f"{question['t']} question: {question['ins']}")
     option_ids = [
-        [tokenizer.mask_token_id]
-        + tokenizer(" " + option.replace(mask_token, " "), add_special_tokens=False)[
-            "input_ids"
-        ][:48]
-        for option in options
+        [tokenizer.mask_token_id] + encode(" " + option, 48) for option in options
     ]
     budget = head_max_length - sum(map(len, option_ids))
     if budget < 16:
@@ -68,14 +69,7 @@ def build_sequence(tokenizer, state, question, max_length, head_max_length):
         markers.append(len(input_ids))
         input_ids.extend(ids)
     input_ids.append(tokenizer.sep_token_id)
-    available = max(0, max_length - len(input_ids) - 1)
-    serialized = (
-        state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
-    )
-    state_ids = tokenizer(
-        serialized.replace(mask_token, " "), add_special_tokens=False
-    )["input_ids"][:available]
-    input_ids.extend(state_ids)
+    input_ids.extend(encode(render(state), max(0, max_length - len(input_ids) - 1)))
     input_ids.append(tokenizer.sep_token_id)
     return input_ids[:max_length], [marker for marker in markers if marker < max_length]
 
@@ -118,9 +112,7 @@ class DecisionModel(nn.Module):
         ).last_hidden_state
         hidden = hidden + self.type_emb(question_type)[:, None, :]
         if self.head is not None:
-            padding_mask = ~attention_mask.bool()
-            for layer in self.head.layers:
-                hidden = layer(hidden, src_key_padding_mask=padding_mask)
+            hidden = self.head(hidden, src_key_padding_mask=~attention_mask.bool())
         index = marker_pos.clamp(min=0)[:, :, None].expand(-1, -1, hidden.size(-1))
         logits = (
             self.scorer(torch.gather(hidden, 1, index))
@@ -133,11 +125,10 @@ class DecisionModel(nn.Module):
         entropy = -(probabilities * torch.log(probabilities.clamp_min(1e-9))).sum(
             -1
         ) / torch.log(count)
-        if probabilities.size(-1) >= 2:
-            top = probabilities.topk(2, -1).values
-        else:
-            top = probabilities.topk(1, -1).values
-            top = torch.cat([top, torch.zeros_like(top)], -1)
+        top_size = min(2, probabilities.size(-1))
+        top = probabilities.topk(top_size, -1).values
+        if top_size < 2:
+            top = torch.cat([top, top.new_zeros(top.size(0), 2 - top_size)], -1)
         features = torch.stack(
             [top[:, 0], top[:, 0] - top[:, 1], entropy, count / 255.0], -1
         )
@@ -163,9 +154,7 @@ def confidence(probabilities):
 
 
 def temperature_bucket(question_type, count):
-    size = (
-        "2" if count <= 2 else "3-5" if count <= 5 else "6-10" if count <= 10 else "11+"
-    )
+    size = ("2", "3-5", "6-10", "11+")[bisect_left((2, 5, 10), count)]
     return f"{QTYPE_NAMES[question_type]}:{size}"
 
 
@@ -178,25 +167,21 @@ def clamp_temperature(value):
 
 
 def collate(items, pad_token_id):
-    batch_size = len(items)
     sequence_length = max(len(item["ids"]) for item in items)
     marker_count = max(len(item["markers"]) for item in items)
-    input_ids = torch.full(
-        (batch_size, sequence_length), pad_token_id, dtype=torch.long
-    )
-    attention_mask = torch.zeros((batch_size, sequence_length), dtype=torch.long)
-    marker_positions = torch.zeros((batch_size, marker_count), dtype=torch.long)
-    marker_mask = torch.zeros((batch_size, marker_count), dtype=torch.bool)
-    for index, item in enumerate(items):
-        length, count = len(item["ids"]), len(item["markers"])
-        input_ids[index, :length] = torch.tensor(item["ids"])
-        attention_mask[index, :length] = 1
-        marker_positions[index, :count] = torch.tensor(item["markers"])
-        marker_mask[index, :count] = True
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "marker_pos": marker_positions,
-        "marker_mask": marker_mask,
+    batch = {
+        "input_ids": torch.full(
+            (len(items), sequence_length), pad_token_id, dtype=torch.long
+        ),
+        "attention_mask": torch.zeros((len(items), sequence_length), dtype=torch.long),
+        "marker_pos": torch.zeros((len(items), marker_count), dtype=torch.long),
+        "marker_mask": torch.zeros((len(items), marker_count), dtype=torch.bool),
         "qtype": torch.tensor([item["qtype"] for item in items]),
     }
+    for index, item in enumerate(items):
+        length, count = len(item["ids"]), len(item["markers"])
+        batch["input_ids"][index, :length] = torch.as_tensor(item["ids"])
+        batch["attention_mask"][index, :length] = 1
+        batch["marker_pos"][index, :count] = torch.as_tensor(item["markers"])
+        batch["marker_mask"][index, :count] = True
+    return batch

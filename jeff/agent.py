@@ -46,41 +46,45 @@ def resolve_model_directory(model_directory=None):
     return directory
 
 
+def _mps_available():
+    return hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+
+
 def resolve_device(device):
+    available = {"cuda": torch.cuda.is_available, "mps": _mps_available}
     if device is None:
-        mps_available = (
-            hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-        )
-        device = (
-            "cuda" if torch.cuda.is_available() else "mps" if mps_available else "cpu"
-        )
+        device = next((name for name, ok in available.items() if ok()), "cpu")
     resolved = torch.device(device)
-    unavailable = resolved.type == "cuda" and not torch.cuda.is_available()
-    unavailable |= resolved.type == "mps" and not (
-        hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-    )
-    if unavailable:
-        warnings.warn(
-            f"{resolved.type.upper()} unavailable; using CPU",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return torch.device("cpu")
-    return resolved
+    is_ok = available.get(resolved.type)
+    if not is_ok or is_ok():
+        return resolved
+    return torch.device("cpu")
 
 
 class Agent:
+    def _device_info(self):
+        kind = self.device.type
+        cuda = kind == "cuda"
+        if kind in ("cpu", "mps"):
+            dtype = torch.float32
+        elif cuda and torch.cuda.get_device_capability(self.device)[0] < 8:
+            dtype = torch.float16
+        else:
+            dtype = (
+                torch.bfloat16
+                if self.config.get("amp_dtype") == "bf16"
+                else torch.float16
+            )
+        return dtype, kind, kind == "cpu", kind == "cuda"
+
     def __init__(self, model_directory=None, device=None):
         self.model_directory = resolve_model_directory(model_directory)
         with (self.model_directory / "rl_agent_config.json").open(
             encoding="utf-8"
         ) as file:
             self.config = json.load(file)
-        missing = [
-            key
-            for key in ("encoder", "head_layers", "max_len", "head_max_len")
-            if key not in self.config
-        ]
+        required = ("encoder", "head_layers", "max_len", "head_max_len")
+        missing = [key for key in required if key not in self.config]
         if missing:
             raise ValueError(
                 f"Invalid model config in {str(self.model_directory)!r}; missing: {', '.join(missing)}"
@@ -111,20 +115,11 @@ class Agent:
                 RuntimeWarning,
                 stacklevel=2,
             )
-        self.dtype = (
-            torch.bfloat16 if self.config.get("amp_dtype") == "bf16" else torch.float16
-        )
-        if (
-            self.device.type == "cuda"
-            and torch.cuda.get_device_capability(self.device)[0] < 8
-        ):
-            self.dtype = torch.float16
-        elif self.device.type in ("cpu", "mps"):
-            self.dtype = torch.float32
+        self.dtype, _, cpu, _ = self._device_info()
         try:
             self.model.to(self.device).eval()
         except (RuntimeError, torch.cuda.OutOfMemoryError) as error:
-            if self.device.type == "cpu":
+            if cpu:
                 raise
             self._fallback_to_cpu(f"Could not place model on {self.device}: {error}")
 
@@ -142,11 +137,8 @@ class Agent:
             raise ValueError("Question requires 'instructions'")
         criteria = question.get("criteria")
         if question_type == "choice":
-            criteria = (
-                {value: None for value in criteria}
-                if isinstance(criteria, list)
-                else criteria
-            )
+            if isinstance(criteria, list):
+                criteria = {value: None for value in criteria}
             if not isinstance(criteria, dict) or not criteria:
                 raise ValueError("Choice question requires non-empty 'criteria'")
         elif question_type == "score" and (
@@ -163,12 +155,9 @@ class Agent:
         if not questions:
             raise ValueError("At least one question is required")
         question_ids = list(questions)
-        normalized = [
-            self.normalize_question(questions[question_id])
-            for question_id in question_ids
-        ]
         items = []
-        for question_id, question in zip(question_ids, normalized):
+        for question_id in question_ids:
+            question = self.normalize_question(questions[question_id])
             sequence, markers = build_sequence(
                 self.tokenizer,
                 state,
@@ -181,25 +170,30 @@ class Agent:
                     f"Question {question_id!r} options exceed head_max_len={self.config['head_max_len']}"
                 )
             items.append(
-                {"ids": sequence, "markers": markers, "qtype": QTYPES[question["t"]]}
+                {
+                    "ids": sequence,
+                    "markers": markers,
+                    "qtype": QTYPES[question["t"]],
+                    "question": question,
+                }
             )
         batch = collate(items, self.tokenizer.pad_token_id)
         try:
             logits, actions = self._forward(batch)
         except (RuntimeError, torch.cuda.OutOfMemoryError) as error:
             message = str(error).lower()
-            if self.device.type == "cpu" or not any(
-                term in message for term in ("memory", "cuda", "mps")
-            ):
+            _, kind, cpu, _ = self._device_info()
+            if cpu or not any(term in message for term in ("memory", kind)):
                 raise
             self._fallback_to_cpu(f"Inference failed on {self.device}: {error}")
             logits, actions = self._forward(batch)
         answers = {}
-        for question_id, question, item, values, action_values in zip(
-            question_ids, normalized, items, logits, actions
+        for question_id, item, values, action_values in zip(
+            question_ids, items, logits, actions
         ):
+            question = item["question"]
             count = len(item["markers"])
-            question_type = QTYPES[question["t"]]
+            question_type = item["qtype"]
             temperature = self.temperature_buckets.get(
                 temperature_bucket(question_type, count),
                 self.temperatures[question_type],
@@ -220,8 +214,10 @@ class Agent:
     @staticmethod
     def _answer(question, probabilities, action_values):
         question_type = question["t"]
-        action = {"act_probability": round(float(action_values[0]), 4)}
-        answer = {"type": question_type}
+        answer = {
+            "type": question_type,
+            "action": {"act_probability": round(float(action_values[0]), 4)},
+        }
         if question_type == "choice":
             labels = list(question["crit"])
             answer.update(
@@ -252,14 +248,14 @@ class Agent:
             answer.update(
                 noul=round(value, 4), confidence=round(max(value, 1.0 - value), 4)
             )
-        answer["action"] = action
         return answer
 
     def _forward(self, batch):
+        _, _, _, cuda = self._device_info()
         with torch.autocast(
             device_type=self.device.type,
             dtype=self.dtype,
-            enabled=self.device.type == "cuda",
+            enabled=cuda,
         ):
             logits, actions = self.model(
                 *(value.to(self.device) for value in batch.values())
