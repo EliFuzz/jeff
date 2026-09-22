@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+.uv-cache
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+model
+
+# AI Slop
+AGENTS.md
+.agents

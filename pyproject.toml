@@ -1,0 +1,10 @@
+[project]
+name = "jeff"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy>=1.20.0",
+  "safetensors>=0.4.0",
+  "torch>=2.0.0",
+  "transformers>=4.48.0,<6"
+]
